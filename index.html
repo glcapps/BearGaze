@@ -1,0 +1,820 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BearGaze Demo in Browser</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='50%' x='50%' dominant-baseline='middle' text-anchor='middle' font-size='90' fill='black'>💾</text></svg>">
+    <script src="https://unpkg.com/htmx.org@1.9.5"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/flowbite/1.6.0/flowbite.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@electric-sql/pglite/dist/index.js"></script>
+    <script>
+        function base64ToUint8Array(base64) {
+            const binary_string = atob(base64);
+            const len = binary_string.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binary_string.charCodeAt(i);
+                if (bytes[i] > 255) {
+                throw new Error("Either atob or string iteration is not spec compliant, please make sure your runtime is supported");
+                }
+            }
+            return bytes;
+        }
+    </script>
+    <script>
+        //shim the json stringify problem for BigInt
+        BigInt.prototype.toJSON = function () {
+            return JSON.rawJSON(this.toString());
+        };
+    </script>
+    <!-- Load Monaco separately to avoid exceptions breaking other functionality -->
+    <script>
+        (function() {
+            try {
+                var monacoScript = document.createElement("script");
+                monacoScript.src = "https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.39.0/min/vs/loader.js";
+                monacoScript.onload = function() {
+                    require.config({ paths: { vs: "https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.39.0/min/vs" } });
+                    require(["vs/editor/editor.main"], function () {
+                        window.monacoLoaded = true;
+                        console.log("Monaco Editor Loaded Successfully");
+                    });
+                };
+                document.head.appendChild(monacoScript);
+            } catch (e) {
+                console.error("Failed to load Monaco Editor:", e);
+            }
+        })();
+    </script>
+
+    <!-- Load Apache Arrow explicitly -->
+    <script type="module">
+        import * as arrow from "https://cdn.jsdelivr.net/npm/apache-arrow@19.0.0/Arrow.es2015.min.js";
+        window.arrow = arrow;
+    </script>
+    <!-- Load all dependencies locally -->
+    <script type="module">
+        // import * as arrow from "./apache-arrow-mjs.js";   
+        import * as tslib from "./tslib-mjs.js";         
+        import * as flatbuffers from "./flatbuffers-mjs.js"; 
+        import * as duckdb from "./duckdb-browser-mjs.js";  
+
+        // Ensure global access to dependencies
+        window.arrow = arrow;
+        window.tslib = tslib;
+        window.flatbuffers = flatbuffers;
+        window.duckdb = duckdb;
+        window.duckDBReady = false; // Mark DuckDB as not ready initially
+
+        async function initDuckDB() {
+            console.log("Initializing DuckDB...");
+
+            const MANUAL_BUNDLES = {
+                mvp: {
+                    mainModule: "./duckdb-mvp.wasm",
+                    mainWorker: "./duckdb-browser-mvp.worker.js",
+                },
+            };
+
+            // Select the appropriate bundle
+            const bundle = await duckdb.selectBundle(MANUAL_BUNDLES);
+            console.log("Bundle Selected:", bundle);
+
+            // Create a worker with the correct path
+            const worker = new Worker(bundle.mainWorker);
+            const logger = new duckdb.ConsoleLogger();
+
+            // Instantiate DuckDB with explicit Arrow module
+            const db = new duckdb.AsyncDuckDB(logger, worker);
+            await db.instantiate(bundle.mainModule, bundle.pthreadWorker, {
+                arrowModule: window.arrow, // Ensure Apache Arrow is correctly passed
+            });
+
+            console.log("DuckDB Successfully Initialized.");
+            window.duckDB = db; // Store DuckDB globally
+            window.duckDBReady = true; // Mark DuckDB as ready
+        }
+
+        // Wait for DuckDB to initialize before running queries
+        await initDuckDB();
+    </script>
+    <script>
+        function generateTableFromJson(jsonData) {
+            if (!Array.isArray(jsonData) || jsonData.length === 0) return "<p>No data available</p>";
+            
+            const columns = Object.keys(jsonData[0]);
+            
+            let table = `<table class="table-auto w-full border-collapse border border-gray-300">
+                            <thead>
+                                <tr class="bg-gray-600">`;
+            
+            columns.forEach(column => {
+                table += `<th class="border border-gray-300 px-4 py-2 cursor-pointer" onclick="sortTable('${column}')">${column}</th>`;
+            });
+            
+            table += `</tr>
+                     </thead>
+                     <tbody>`;
+            
+            jsonData.forEach(row => {
+                table += `<tr class="border border-gray-300">`;
+                columns.forEach(column => {
+                    table += `<td class="border border-gray-300 px-4 py-2">${row[column]}</td>`;
+                });
+                table += `</tr>`;
+            });
+            
+            table += `</tbody>
+                    </table>`;
+            
+            return table;
+        }
+    </script>
+</head>
+<body class="bg-gray-900 text-white p-6">
+
+    <div class="max-w-4xl mx-auto">
+        <h1 class="text-2xl font-bold mb-4">BearGaze: Progressive Image Enhancement</h1>
+        
+        <div class="relative w-full max-w-3xl mx-auto aspect-[4/3] bg-gray-700 rounded overflow-hidden">
+            <img 
+                id="irises-image" 
+                src="Irises-Initial.png" 
+                alt="Irises by Van Gogh" 
+                class="absolute inset-0 w-full h-full object-contain transition-opacity duration-500 opacity-100"
+                loading="lazy"
+            >
+        </div>
+        <div class="w-full max-w-3xl mx-auto mt-4">
+            <button 
+                id="upscale-button"
+                class="bg-blue-600 hover:bg-blue-800 text-white px-4 py-2 rounded"
+                onclick="progressiveUpscale()"
+            >
+                Upscale Image
+            </button>
+        </div>
+    
+        <div class="bg-gray-800 p-4 rounded-lg shadow-lg mb-6">
+            <h2 class="text-lg font-semibold mb-2">Image Data Query</h2>
+            <div class="flex gap-2 mb-2">
+                <button class="bg-gray-600 hover:bg-gray-700 text-white px-4 py-2 rounded" onclick="prefillDuckDBQuery(0)">Sample Query Parquet</button>
+            </div>
+            <div id="duckdb-editor" class="h-40 border rounded bg-gray-700"></div>
+            <button class="mt-2 bg-green-500 hover:bg-green-700 text-white px-4 py-2 rounded" onclick="runDuckDBQuery()">Run Query</button>
+            <!-- Tabs Navigation -->
+            <div class="w-full max-w-3xl mx-auto">
+                <div class="flex border-b" data-tabs-toggle="#duckdb-tabs">
+                    <button id="tab-json" class="px-4 py-2 focus:outline-none" role="tab" data-tabs-target="#jsonTab" aria-selected="true">
+                        JSON Output
+                    </button>
+                    <button id="tab-table" class="px-4 py-2 focus:outline-none" role="tab" data-tabs-target="#tableTab">
+                        Table Output
+                    </button>
+                </div>
+
+                <!-- Tabs Content Container -->
+                <div id="duckdb-tabs" class="h-[500px] overflow-hidden">
+                    <!-- JSON Tab Content -->
+                    <div id="jsonTab" role="tabpanel" class="p-4 h-full overflow-y-auto" aria-labelledby="tab-json">
+                        <pre id="duckdb-output" class="overflow-auto p-4 bg-gray-700 border rounded"></pre>
+                    </div>
+
+                    <!-- Table Tab Content -->
+                    <div id="tableTab" role="tabpanel" class="p-4 h-full overflow-y-auto hidden" aria-labelledby="tab-table">
+                        <div id="duckdb-outputTableContainer" class="overflow-auto"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div> 
+
+
+    <script>
+        async function runDuckDBQuery() {
+            if (!window.duckDBReady) {
+                document.getElementById("duckdb-output").textContent = "Error: DuckDB not initialized. Please wait...";
+                return;
+            }
+
+            const query = window.duckDBEditor.getValue();
+            try {
+                const conn = await window.duckDB.connect();
+                const result = await conn.query(query);
+                document.getElementById("duckdb-output").textContent = JSON.stringify(result.toArray(), null, 2);
+                document.getElementById("duckdb-outputTableContainer").innerHTML = generateTableFromJson(result.toArray());
+                conn.close();
+            } catch (error) {
+                document.getElementById("duckdb-output").textContent = "Error: " + error.message;
+                document.getElementById("duckdb-outputTableContainer").innerHTML = "";
+            }
+        }
+
+        (function waitForMonaco() {
+            if (window.monacoLoaded) {
+                window.duckDBEditor = monaco.editor.create(document.getElementById("duckdb-editor"), {
+                    value: `SELECT 'Hello, World' AS "greeting"`,
+                    language: "sql",
+                    theme: "vs-dark"
+                });
+            } else {
+                setTimeout(waitForMonaco, 100);
+            }
+        })();
+    </script>
+    <script>
+        function prefillDuckDBQuery(queryIndex) {
+            const queries = [
+                `SELECT * 
+FROM 'https://pub-b1775268df954b4ea5d060e3b4cbf6cc.r2.dev/synthetic_text_to_sql_train.snappy.parquet'
+LIMIT 10;`,
+                `SELECT COUNT(*) AS "count"
+FROM 'https://shell.duckdb.org/data/tpch/0_01/parquet/lineitem.parquet';`,
+                `SELECT l_shipmode AS "shipmode"
+, l_quantity AS "quantity"
+, l_shipdate AS "shipdate"
+FROM 'https://shell.duckdb.org/data/tpch/0_01/parquet/lineitem.parquet' 
+LIMIT 100;`,
+                `SELECT n_name AS 'NationName',
+AVG(c_acctbal) AS 'AverageBalance'
+FROM
+    'https://shell.duckdb.org/data/tpch/0_01/parquet/customer.parquet',
+    'https://shell.duckdb.org/data/tpch/0_01/parquet/nation.parquet'
+WHERE c_nationkey = n_nationkey
+GROUP BY n_name;`,
+`SELECT *
+FROM READ_CSV_AUTO('https://docs.google.com/spreadsheets/d/1fy3GbhVC8iuA9JZTqhzG3Ij_8nIn_PoZnZK2ofpZ0rs/gviz/tq?tqx=out:csv');`,
+`SELECT p.movie_id AS "movieId", p.title, p.plain_full_script AS "fullScript"
+FROM READ_PARQUET('https://pub-b1775268df954b4ea5d060e3b4cbf6cc.r2.dev/plain_full_script.parquet') AS p
+INNER JOIN READ_CSV_AUTO('https://docs.google.com/spreadsheets/d/1fy3GbhVC8iuA9JZTqhzG3Ij_8nIn_PoZnZK2ofpZ0rs/gviz/tq?tqx=out:csv') AS c
+USING (movie_id, title)
+LIMIT 3;`,
+`SELECT DATE_TRUNC('month', current_date);`,
+`LOAD autocomplete;
+SELECT *
+FROM sql_auto_complete('SELECT * FRO');`
+            ];
+            if (window.duckDBEditor && queries[queryIndex]) {
+                window.duckDBEditor.setValue(queries[queryIndex]);
+            }
+        }
+    </script>
+
+    <script>
+        (function loadPgMock() {
+            return
+            try {
+                var pgMockScript = document.createElement("script");
+                pgMockScript.src = "https://cdn.jsdelivr.net/npm/pgmock@latest";
+                pgMockScript.onload = function() {
+                    console.log("pgMock Loaded Successfully");
+                    window.pgMockInstance = new pgMock();
+                };
+                document.head.appendChild(pgMockScript);
+            } catch (e) {
+                console.error("Failed to load pgMock:", e);
+            }
+        })();
+    </script>
+    
+    <script>
+        (function enableSQLIntelliSense() {
+            if (window.monacoLoaded) {
+                monaco.languages.registerCompletionItemProvider("sql", {
+                    provideCompletionItems: function (model, position) {
+                        var word = model.getWordUntilPosition(position);
+                        var range = {
+                            startLineNumber: position.lineNumber,
+                            endLineNumber: position.lineNumber,
+                            startColumn: word.startColumn,
+                            endColumn: word.endColumn,
+                        };
+                
+                        const sqlKeywords = [
+                            // Standard SQL Keywords
+                            "SELECT", "FROM", "WHERE", "INSERT", "UPDATE", "DELETE", "JOIN", 
+                            "ORDER BY", "GROUP BY", "HAVING", "DISTINCT", "AS", "AND", "OR", 
+                            "NOT", "NULL", "IS", "IN", "EXISTS", "BETWEEN", "CASE", "WHEN", 
+                            "THEN", "ELSE", "END", "LIMIT", "OFFSET", "CREATE", "ALTER", 
+                            "DROP", "TABLE", "INDEX", "VIEW", "TRIGGER", "PRIMARY KEY", 
+                            "FOREIGN KEY", "CHECK", "DEFAULT", "UNIQUE", "WITH", "RECURSIVE",
+                            "EXPLAIN", "DESCRIBE", "SHOW", "COMMIT", "ROLLBACK", "TRANSACTION",
+                            "SAVEPOINT", "RELEASE", "SET", "LIKE", "ESCAPE", "INTERSECT",
+                            "UNION", "EXCEPT", "VALUES", "CROSS JOIN", "NATURAL JOIN",
+                            "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN", "ON", "USING",
+
+                            // Data Types
+                            "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "BOOLEAN", "VARCHAR", 
+                            "TEXT", "FLOAT", "DOUBLE", "REAL", "DECIMAL", "NUMERIC", "BLOB", 
+                            "DATE", "TIME", "TIMESTAMP", "UUID", "INTERVAL", "ARRAY", "MAP", 
+                            "STRUCT", //"JSON",
+
+                            // DuckDB Common Functions
+                            "COUNT", "AVG", "MIN", "MAX", "ROUND", "CEIL", "FLOOR", //"SUM", 
+                            "ABS", "SIGN", "TRUNCATE", "EXP", "LN", "LOG", "LOG2", "LOG10", 
+                            "POWER", "SQRT", "PI", "SIN", "COS", "TAN", "COT", "DEGREES", 
+                            "RADIANS", "MOD", "GREATEST", "LEAST", "RANDOM", "SEQUENCE",
+
+                            // String Functions
+                            "UPPER", "LOWER", "LENGTH", "SUBSTRING", "POSITION", "TRIM", 
+                            "LTRIM", "RTRIM", "REPLACE", "CONCAT", "REPEAT", "LEFT", "RIGHT", 
+                            "SPLIT_PART", "REGEXP_MATCHES", "REGEXP_REPLACE", "FORMAT", 
+                            "CHAR_LENGTH", "OCTET_LENGTH", "ASCII", "CHR", "ILIKE",
+
+                            // Date & Time Functions
+                            "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "DATE_PART", 
+                            "DATE_TRUNC", "EXTRACT", "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", 
+                            "SECOND", "EPOCH", "AGE", "NOW", "TIMEZONE", "MAKE_DATE", 
+                            "MAKE_TIME", "MAKE_TIMESTAMP", "TO_TIMESTAMP", "TO_DATE", 
+                            "TO_TIME", "INTERVAL",
+
+                            // Aggregate Functions
+                            "GROUP_CONCAT", "ARRAY_AGG", "STRING_AGG", "MEDIAN", "MODE", 
+                            "PERCENTILE_CONT", "PERCENTILE_DISC", "STDDEV", "VARIANCE", 
+                            "COVAR_POP", "COVAR_SAMP", "CORR", "REGR_SLOPE", "REGR_INTERCEPT",
+
+                            // Window Functions
+                            "RANK", "DENSE_RANK", "ROW_NUMBER", "NTILE", "LAG", "LEAD", 
+                            "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE", "CUME_DIST", "PERCENT_RANK",
+
+                            // JSON Functions
+                            "JSON", "JSON_EXTRACT", "JSON_EXTRACT_SCALAR", "JSON_TYPE", 
+                            "JSON_VALID", "JSON_OBJECT", "JSON_ARRAY", "JSON_GROUP_ARRAY",
+                            "JSON_GROUP_OBJECT", "JSONB",
+
+                            // Array & Map Functions
+                            "ARRAY_LENGTH", "ARRAY_APPEND", "ARRAY_PREPEND", "ARRAY_CONCAT",
+                            "ARRAY_POSITION", "ARRAY_REPLACE", "ARRAY_SLICE", "MAP_KEYS", 
+                            "MAP_VALUES", "MAP_ENTRIES",
+
+                            // File & Parquet Functions (DuckDB-specific)
+                            "READ_CSV", "READ_PARQUET", "READ_JSON", "WRITE_CSV", "WRITE_PARQUET",
+                            "WRITE_JSON", "LIST_FILES", "LOAD_EXTENSION", "INSTALL_EXTENSION",
+
+                            // Miscellaneous
+                            "CASE WHEN", "CAST", "COALESCE", "NULLIF", "GREATEST",
+                            "IFNULL", "IF", "DECODE", "ENCODE", "MD5", "SHA256", "UNNEST", 
+                            "TABLESAMPLE", "ANY_VALUE"
+                        ];
+                
+                        return {
+                            suggestions: sqlKeywords.map(keyword => ({
+                                label: keyword,
+                                kind: monaco.languages.CompletionItemKind.Keyword,
+                                insertText: keyword + " ", // Adds trailing space
+                                insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, // Ensures proper insertion
+                                range: range,
+                            }))
+                        };
+                    }
+                });
+                monaco.languages.registerSignatureHelpProvider('sql', {
+                    signatureHelpTriggerCharacters: ['(', ','],
+                    provideSignatureHelp: function (model, position) {
+                        return {
+                            value: {
+                                signatures: [
+                                    {
+                                        label: 'SUM(expression)',
+                                        parameters: [
+                                            { label: 'expression', documentation: 'A numeric column or expression' }
+                                        ]
+                                    },
+                                    {
+                                        label: 'AVG(expression)',
+                                        parameters: [
+                                            { label: 'expression', documentation: 'A numeric column or expression' }
+                                        ]
+                                    },
+                                    {
+                                        label: 'STRING_AGG(expression, delimiter)',
+                                        parameters: [
+                                            { label: 'expression', documentation: 'A string column or expression' },
+                                            { label: 'delimiter', documentation: 'String delimiter used for aggregation' }
+                                        ]
+                                    },
+                                    {
+                                        label: 'DATE_TRUNC(unit, date)',
+                                        parameters: [
+                                            { label: 'unit', documentation: 'Time unit (year, month, day, hour, etc.)' },
+                                            { label: 'date', documentation: 'A timestamp or date' }
+                                        ]
+                                    }
+                                ],
+                                activeSignature: 0,
+                                activeParameter: 0
+                            },
+                            dispose: () => {}
+                        };
+                    }
+                });
+                const sqlKeywordsAndFunctions = {
+                    // 🔹 SQL Keywords from Queries
+                    "SELECT": {
+                        signature: "SELECT columns FROM table",
+                        description: "Retrieves data from a table.",
+                        example: "Example: `SELECT name, age FROM users;`"
+                    },
+                    "FROM": {
+                        signature: "FROM table",
+                        description: "Specifies the source table for the query.",
+                        example: "Example: `SELECT * FROM customers;`"
+                    },
+                    "WHERE": {
+                        signature: "WHERE condition",
+                        description: "Filters results based on a condition.",
+                        example: "Example: `SELECT * FROM users WHERE age > 30;`"
+                    },
+                    "GROUP BY": {
+                        signature: "GROUP BY column",
+                        description: "Groups rows that have the same values into summary rows.",
+                        example: "Example: `SELECT department, COUNT(*) FROM employees GROUP BY department;`"
+                    },
+                    "LIMIT": {
+                        signature: "LIMIT number",
+                        description: "Limits the number of returned rows.",
+                        example: "Example: `SELECT * FROM customers LIMIT 100;`"
+                    },
+                    "INNER JOIN": {
+                        signature: "INNER JOIN table ON condition",
+                        description: "Returns only matching rows from both tables.",
+                        example: "Example:\n```sql\nSELECT p.movie_id, p.title, p.plain_full_script \nFROM read_parquet('movies.parquet') AS p \nINNER JOIN READ_CSV_AUTO('movies.csv') AS c \nON p.movie_id = c.movie_id;\n```"
+                    },
+                    "USING": {
+                        signature: "JOIN table USING (column1, column2, ...)",
+                        description: "Joins tables on common column(s) without repeating them.",
+                        example: "Example:\n```sql\nSELECT p.movie_id, p.title, p.plain_full_script \nFROM read_parquet('movies.parquet') AS p \nJOIN READ_CSV_AUTO('movies.csv') AS c \nUSING (movie_id, title);\n```"
+                    },
+
+                    // 🔹 DuckDB-Specific Keywords
+                    "READ_CSV_AUTO": {
+                        signature: "READ_CSV_AUTO(file_path)",
+                        description: "Automatically reads a CSV file into a DuckDB table.",
+                        example: "Example: `SELECT * FROM READ_CSV_AUTO('data.csv');`"
+                    },
+                    "LOAD": {
+                        signature: "LOAD extension",
+                        description: "Loads a DuckDB extension.",
+                        example: "Example: `LOAD autocomplete;`"
+                    },
+                    "sql_auto_complete": {
+                        signature: "sql_auto_complete(query)",
+                        description: "Provides SQL auto-completion for the given query string.",
+                        example: "Example: `SELECT * FROM sql_auto_complete('SELECT * FRO');`"
+                    },
+
+                    // 🔹 SQL Operators & Clauses
+                    "AND": {
+                        signature: "condition AND condition",
+                        description: "Combines multiple conditions in a WHERE clause.",
+                        example: "Example: `SELECT * FROM users WHERE age > 30 AND active = TRUE;`"
+                    },
+                    "OR": {
+                        signature: "condition OR condition",
+                        description: "Returns results if at least one condition is met.",
+                        example: "Example: `SELECT * FROM users WHERE age > 30 OR active = TRUE;`"
+                    },
+                    "AS": {
+                        signature: "column AS alias",
+                        description: "Renames a column or table in the output.",
+                        example: "Example: `SELECT name AS customer_name FROM customers;`"
+                    },
+                    "NOT": {
+                        signature: "NOT condition",
+                        description: "Negates a condition.",
+                        example: "Example: `SELECT * FROM users WHERE NOT active;`"
+                    },
+
+                    // 🔹 SQL Functions from Queries
+                    "COUNT": {
+                        signature: "COUNT(expression)",
+                        description: "Returns the count of rows matching the expression.",
+                        example: "Example: `SELECT COUNT(*) FROM employees;`"
+                    },
+                    "AVG": {
+                        signature: "AVG(expression)",
+                        description: "Returns the average value of a column.",
+                        example: "Example: `SELECT AVG(salary) FROM employees;`"
+                    },
+                    "CAST": {
+                        signature: "CAST(expression AS type) or expression::type",
+                        description: "Converts an expression to a specified type.",
+                        example: "Example: `SELECT 42::STRING;`"
+                    },
+                    "STRING": {
+                        signature: "CAST(expression AS STRING) or expression::STRING",
+                        description: "Converts an expression into a string representation.",
+                        example: "Example: `SELECT 12345::STRING AS text_value;` or `SELECT CAST(employeenumber AS STRING) FROM employees;`"
+                    }
+                };
+
+                monaco.languages.registerHoverProvider('sql', {
+                    provideHover: function (model, position) {
+                        const wordAtPosition = model.getWordAtPosition(position);
+                        if (!wordAtPosition) return null; // No word found
+
+                        let word = wordAtPosition.word.toUpperCase(); // Normalize case
+                        let previousWord = model.getWordAtPosition(new monaco.Position(position.lineNumber, wordAtPosition.startColumn - 1));
+                        let nextWord = model.getWordAtPosition(new monaco.Position(position.lineNumber, wordAtPosition.endColumn + 1));
+
+                        // Try forming a multi-word keyword (previous + current)
+                        if (previousWord) {
+                            const multiWordKey = previousWord.word.toUpperCase() + " " + word;
+                            if (sqlKeywordsAndFunctions[multiWordKey]) {
+                                word = multiWordKey;
+                            }
+                        }
+
+                        // Try forming a multi-word keyword (current + next)
+                        if (nextWord) {
+                            const multiWordKey = word + " " + nextWord.word.toUpperCase();
+                            if (sqlKeywordsAndFunctions[multiWordKey]) {
+                                word = multiWordKey;
+                            }
+                        }
+
+                        if (sqlKeywordsAndFunctions[word]) {
+                            return {
+                                range: new monaco.Range(
+                                    position.lineNumber,
+                                    wordAtPosition.startColumn,
+                                    position.lineNumber,
+                                    wordAtPosition.endColumn
+                                ),
+                                contents: [
+                                    { value: `**${sqlKeywordsAndFunctions[word].signature}**` },
+                                    { value: sqlKeywordsAndFunctions[word].description },
+                                    { value: sqlKeywordsAndFunctions[word].example }
+                                ]
+                            };
+                        }
+
+                        return null; // No match, no hover info
+                    }
+                });
+                monaco.languages.registerCompletionItemProvider('sql', {
+                    provideCompletionItems: function () {
+                        return {
+                            suggestions: [
+                                {
+                                    label: 'SUM',
+                                    kind: monaco.languages.CompletionItemKind.Function,
+                                    insertText: 'SUM(${1:expression})',
+                                    insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+                                    documentation: 'Returns the sum of a column or expression'
+                                },
+                                {
+                                    label: 'AVG',
+                                    kind: monaco.languages.CompletionItemKind.Function,
+                                    insertText: 'AVG(${1:expression})',
+                                    insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+                                    documentation: 'Returns the average of a column or expression'
+                                },
+                                {
+                                    label: 'STRING_AGG',
+                                    kind: monaco.languages.CompletionItemKind.Function,
+                                    insertText: 'STRING_AGG(${1:expression}, ${2:delimiter})',
+                                    insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+                                    documentation: 'Aggregates string values with a delimiter'
+                                },
+                                {
+                                    label: 'DATE_TRUNC',
+                                    kind: monaco.languages.CompletionItemKind.Function,
+                                    insertText: 'DATE_TRUNC(${1:unit}, ${2:date})',
+                                    insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+                                    documentation: 'Truncates a timestamp to a specified unit'
+                                }
+                            ]
+                        };
+                    }
+                });
+                console.log("DuckDB SQL IntelliSense Enabled");
+                // monaco.languages.registerCompletionItemProvider("plsql", {
+                //     provideCompletionItems: function (model, position) {
+                //         var word = model.getWordUntilPosition(position);
+                //         var range = {
+                //             startLineNumber: position.lineNumber,
+                //             endLineNumber: position.lineNumber,
+                //             startColumn: word.startColumn,
+                //             endColumn: word.endColumn,
+                //         };
+                
+                //         const sqlKeywords = [
+                //             // Standard SQL Keywords
+                //             "SELECT", "FROM", "WHERE", "INSERT", "UPDATE", "DELETE", "JOIN", 
+                //             "ORDER BY", "GROUP BY", "HAVING", "DISTINCT", "AS", "AND", "OR", 
+                //             "NOT", "NULL", "IS", "IN", "EXISTS", "BETWEEN", "CASE", "WHEN", 
+                //             "THEN", "ELSE", "END", "LIMIT", "OFFSET", "CREATE", "ALTER", 
+                //             "DROP", "TABLE", "INDEX", "VIEW", "TRIGGER", "PRIMARY KEY", 
+                //             "FOREIGN KEY", "CHECK", "DEFAULT", "UNIQUE", "WITH", "RECURSIVE",
+                //             "EXPLAIN", "DESCRIBE", "SHOW", "COMMIT", "ROLLBACK", "TRANSACTION",
+                //             "SAVEPOINT", "RELEASE", "SET", "LIKE", "ESCAPE", "INTERSECT",
+                //             "UNION", "EXCEPT", "VALUES", "CROSS JOIN", "NATURAL JOIN",
+                //             "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN", "ON", "USING",
+                //             "WINDOW", "PARTITION BY", "TABLESAMPLE", "LATERAL", "RETURNING",
+                //             "DO", "LANGUAGE", "PLPGSQL", "DECLARE",
+
+                //             // Data Types
+                //             "INTEGER", "BIGINT", "SMALLINT", "SERIAL", "BIGSERIAL", "BOOLEAN", 
+                //             "VARCHAR", "TEXT", "FLOAT", "DOUBLE PRECISION", "REAL", "DECIMAL", 
+                //             "NUMERIC", "BYTEA", "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", 
+                //             "UUID", "INTERVAL", "ARRAY", "JSON", "JSONB", "HSTORE", "TSVECTOR", 
+                //             "TSQUERY", "INET", "CIDR", "MACADDR", "MONEY", "POINT", "LINE", 
+                //             "LSEG", "BOX", "PATH", "POLYGON", "CIRCLE",
+
+                //             // PostgreSQL Common Functions
+                //             "COUNT", "SUM", "AVG", "MIN", "MAX", "ROUND", "CEIL", "FLOOR", 
+                //             "ABS", "SIGN", "TRUNC", "EXP", "LN", "LOG", "LOG2", "LOG10", 
+                //             "POWER", "SQRT", "PI", "SIN", "COS", "TAN", "COT", "DEGREES", 
+                //             "RADIANS", "MOD", "GREATEST", "LEAST", "RANDOM", "SEQUENCE",
+                //             "GENERATE_SERIES",
+
+                //             // String Functions
+                //             "UPPER", "LOWER", "LENGTH", "SUBSTRING", "POSITION", "TRIM", 
+                //             "LTRIM", "RTRIM", "REPLACE", "CONCAT", "REPEAT", "LEFT", "RIGHT", 
+                //             "SPLIT_PART", "REGEXP_MATCHES", "REGEXP_REPLACE", "FORMAT", 
+                //             "CHAR_LENGTH", "OCTET_LENGTH", "ASCII", "CHR", "LIKE", "ILIKE",
+                //             "TO_CHAR", "TO_NUMBER", "TO_DATE", "TO_TIMESTAMP",
+
+                //             // Date & Time Functions
+                //             "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "DATE_PART", 
+                //             "DATE_TRUNC", "EXTRACT", "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", 
+                //             "SECOND", "EPOCH", "AGE", "NOW", "TIMEZONE", "MAKE_DATE", 
+                //             "MAKE_TIME", "MAKE_TIMESTAMP", "INTERVAL",
+
+                //             // Aggregate Functions
+                //             "GROUP_CONCAT", "ARRAY_AGG", "STRING_AGG", "MEDIAN", "MODE", 
+                //             "PERCENTILE_CONT", "PERCENTILE_DISC", "STDDEV", "VARIANCE", 
+                //             "COVAR_POP", "COVAR_SAMP", "CORR", "REGR_SLOPE", "REGR_INTERCEPT",
+
+                //             // Window Functions
+                //             "RANK", "DENSE_RANK", "ROW_NUMBER", "NTILE", "LAG", "LEAD", 
+                //             "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE", "CUME_DIST", "PERCENT_RANK",
+
+                //             // JSON & JSONB Functions
+                //             "JSONB_OBJECT", "JSONB_ARRAY", "JSONB_EXTRACT_PATH", 
+                //             "JSONB_EXTRACT_PATH_TEXT", "JSONB_AGG", "JSONB_BUILD_OBJECT",
+                //             "JSONB_BUILD_ARRAY", "JSONB_SET", "JSONB_INSERT", "JSONB_DELETE",
+                //             "JSONB_PATH_QUERY", "JSONB_EACH", "JSONB_EACH_TEXT",
+
+                //             // Array & HSTORE Functions
+                //             "ARRAY_LENGTH", "ARRAY_APPEND", "ARRAY_PREPEND", "ARRAY_CONCAT",
+                //             "ARRAY_POSITION", "ARRAY_REPLACE", "ARRAY_SLICE", "HSTORE",
+                //             "HSTORE_TO_JSON", "HSTORE_TO_JSONB", "EACH", "HSTORE_EXISTS",
+
+                //             // Full-Text Search Functions
+                //             "TO_TSVECTOR", "TO_TSQUERY", "WEBSEARCH_TO_TSQUERY", "PHRASETO_TSQUERY",
+                //             "PLAINTO_TSQUERY", "TS_RANK", "TS_RANK_CD",
+
+                //             // Geospatial Functions
+                //             "ST_AsText", "ST_GeomFromText", "ST_Distance", "ST_Intersects", 
+                //             "ST_Within", "ST_Contains", "ST_Area", "ST_Length",
+
+                //             // Indexing & Performance
+                //             "CREATE INDEX", "DROP INDEX", "CLUSTER", "ANALYZE", "VACUUM",
+                //             "EXPLAIN ANALYZE", "PG_STAT_STATEMENTS_RESET",
+
+                //             // Security & Roles
+                //             "GRANT", "REVOKE", "CREATE USER", "ALTER USER", "DROP USER",
+                //             "CREATE ROLE", "ALTER ROLE", "DROP ROLE",
+
+                //             // Miscellaneous
+                //             "CASE WHEN", "CAST", "COALESCE", "NULLIF", "GREATEST", "LEAST", 
+                //             "IFNULL", "DECODE", "ENCODE", "MD5", "SHA256", "UNNEST", 
+                //             "ANY_VALUE", "CITEXT", "LATERAL", "RETURNING"
+                //         ];
+                
+                //         return {
+                //             suggestions: sqlKeywords.map(keyword => ({
+                //                 label: keyword,
+                //                 kind: monaco.languages.CompletionItemKind.Keyword,
+                //                 insertText: keyword + " ", // Adds trailing space
+                //                 insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, // Ensures proper insertion
+                //                 range: range,
+                //             }))
+                //         };
+                //     }
+                // });
+                // console.log("Postgred SQL IntelliSense Enabled");
+            } else {
+                setTimeout(enableSQLIntelliSense, 100);
+            }
+        })();
+    </script>
+</body>
+<script>
+    // --- Pixel blending helper functions ---
+    function averagePixel(p1, p2) {
+        return [
+            (p1[0] + p2[0]) >> 1,
+            (p1[1] + p2[1]) >> 1,
+            (p1[2] + p2[2]) >> 1,
+            (p1[3] + p2[3]) >> 1
+        ];
+    }
+
+    function maxPixel(p1, p2) {
+        return [
+            Math.max(p1[0], p2[0]),
+            Math.max(p1[1], p2[1]),
+            Math.max(p1[2], p2[2]),
+            Math.max(p1[3], p2[3])
+        ];
+    }
+
+    function minPixel(p1, p2) {
+        return [
+            Math.min(p1[0], p2[0]),
+            Math.min(p1[1], p2[1]),
+            Math.min(p1[2], p2[2]),
+            Math.min(p1[3], p2[3])
+        ];
+    }
+
+    // Array of blend functions. In the future this could be database-driven.
+    const pixelBlendFunctions = [averagePixel, maxPixel, minPixel];
+
+    function upscaleImageToCanvas(img, scale = 2) {
+        const originalCanvas = document.createElement('canvas');
+        originalCanvas.width = img.naturalWidth;
+        originalCanvas.height = img.naturalHeight;
+        const originalCtx = originalCanvas.getContext('2d');
+        originalCtx.drawImage(img, 0, 0);
+        const originalImageData = originalCtx.getImageData(0, 0, img.naturalWidth, img.naturalHeight);
+        const originalPixels = originalImageData.data;
+
+        const newWidth = img.naturalWidth * scale;
+        const newHeight = img.naturalHeight * scale;
+        const canvas = document.createElement('canvas');
+        canvas.width = newWidth;
+        canvas.height = newHeight;
+        const ctx = canvas.getContext('2d');
+        const newImageData = ctx.createImageData(newWidth, newHeight);
+        const newPixels = newImageData.data;
+
+        for (let y = 0; y < img.naturalHeight - 1; y++) {
+            for (let x = 0; x < img.naturalWidth - 1; x++) {
+                const idx1 = (y * img.naturalWidth + x) * 4;
+                const idx2 = ((y + 1) * img.naturalWidth + (x + 1)) * 4;
+
+                const p1 = [
+                    originalPixels[idx1],
+                    originalPixels[idx1 + 1],
+                    originalPixels[idx1 + 2],
+                    originalPixels[idx1 + 3]
+                ];
+
+                const p2 = [
+                    originalPixels[idx2],
+                    originalPixels[idx2 + 1],
+                    originalPixels[idx2 + 2],
+                    originalPixels[idx2 + 3]
+                ];
+
+                // Randomly select a blend function for this pixel
+                // In the future, selection could be database-driven per pixel
+                const blendFn = pixelBlendFunctions[Math.floor(Math.random() * pixelBlendFunctions.length)];
+                const [r, g, b, a] = blendFn(p1, p2);
+
+                for (let dy = 0; dy < scale; dy++) {
+                    for (let dx = 0; dx < scale; dx++) {
+                        const newX = x * scale + dx;
+                        const newY = y * scale + dy;
+                        const newIdx = (newY * newWidth + newX) * 4;
+                        newPixels[newIdx] = r;
+                        newPixels[newIdx + 1] = g;
+                        newPixels[newIdx + 2] = b;
+                        newPixels[newIdx + 3] = a;
+                    }
+                }
+            }
+        }
+
+        ctx.putImageData(newImageData, 0, 0);
+        return canvas;
+    }
+
+    function progressiveUpscale() {
+        const img = document.getElementById('irises-image');
+        if (!img) {
+            console.warn("No image found to upscale.");
+            return;
+        }
+
+        const canvas = upscaleImageToCanvas(img);
+
+        canvas.toBlob(blob => {
+            const blobUrl = URL.createObjectURL(blob);
+            const highImg = document.createElement('img');
+            highImg.src = blobUrl;
+            highImg.alt = "Upscaled Irises";
+            highImg.className = img.className;
+            highImg.id = img.id;
+            img.replaceWith(highImg);
+            console.log("Upscaled image displayed via blob.");
+        }, "image/png");
+    }
+</script>
+</html>
