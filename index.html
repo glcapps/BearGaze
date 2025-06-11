@@ -228,33 +228,8 @@
         function prefillDuckDBQuery(queryIndex) {
             const queries = [
                 `SELECT * 
-FROM 'https://pub-b1775268df954b4ea5d060e3b4cbf6cc.r2.dev/synthetic_text_to_sql_train.snappy.parquet'
-LIMIT 10;`,
-                `SELECT COUNT(*) AS "count"
-FROM 'https://shell.duckdb.org/data/tpch/0_01/parquet/lineitem.parquet';`,
-                `SELECT l_shipmode AS "shipmode"
-, l_quantity AS "quantity"
-, l_shipdate AS "shipdate"
-FROM 'https://shell.duckdb.org/data/tpch/0_01/parquet/lineitem.parquet' 
-LIMIT 100;`,
-                `SELECT n_name AS 'NationName',
-AVG(c_acctbal) AS 'AverageBalance'
-FROM
-    'https://shell.duckdb.org/data/tpch/0_01/parquet/customer.parquet',
-    'https://shell.duckdb.org/data/tpch/0_01/parquet/nation.parquet'
-WHERE c_nationkey = n_nationkey
-GROUP BY n_name;`,
-`SELECT *
-FROM READ_CSV_AUTO('https://docs.google.com/spreadsheets/d/1fy3GbhVC8iuA9JZTqhzG3Ij_8nIn_PoZnZK2ofpZ0rs/gviz/tq?tqx=out:csv');`,
-`SELECT p.movie_id AS "movieId", p.title, p.plain_full_script AS "fullScript"
-FROM READ_PARQUET('https://pub-b1775268df954b4ea5d060e3b4cbf6cc.r2.dev/plain_full_script.parquet') AS p
-INNER JOIN READ_CSV_AUTO('https://docs.google.com/spreadsheets/d/1fy3GbhVC8iuA9JZTqhzG3Ij_8nIn_PoZnZK2ofpZ0rs/gviz/tq?tqx=out:csv') AS c
-USING (movie_id, title)
-LIMIT 3;`,
-`SELECT DATE_TRUNC('month', current_date);`,
-`LOAD autocomplete;
-SELECT *
-FROM sql_auto_complete('SELECT * FRO');`
+FROM 'BLENDMAP.parquet'
+LIMIT 10;`
             ];
             if (window.duckDBEditor && queries[queryIndex]) {
                 window.duckDBEditor.setValue(queries[queryIndex]);
@@ -817,4 +792,26 @@ FROM sql_auto_complete('SELECT * FRO');`
         }, "image/png");
     }
 </script>
+    <script>
+        async function loadBlendMapParquet() {
+            if (!window.duckDBReady) {
+                console.warn("DuckDB is not ready yet.");
+                return;
+            }
+
+            try {
+                const conn = await window.duckDB.connect();
+                const result = await conn.query("SELECT * FROM 'blendMap.parquet';");
+                window.blendMap = result.toArray();
+                console.log("Blend map loaded:", window.blendMap);
+                conn.close();
+            } catch (error) {
+                console.error("Failed to load blend map:", error);
+            }
+        }
+
+        window.addEventListener('load', () => {
+            loadBlendMapParquet();
+        });
+    </script>
 </html>
